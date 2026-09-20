@@ -1,0 +1,107 @@
+---
+title: "Decisiones técnicas"
+description: "Decisiones clave visibles en el código y por qué importan"
+---
+
+Esta página documenta decisiones de arquitectura **inferidas del código** (no hay un ADR — Architecture Decision Record — en el repo). Donde no se encontró una razón explícita documentada (comentario, commit, `AGENTS.md`), se marca como tal.
+
+## Payload CMS como backend embebido, no headless separado
+
+**Decisión**: Payload corre *dentro* del mismo proceso/deploy de Next.js (`withPayload()` en `next.config.ts`), en lugar de ser un servicio backend independiente.
+
+**Por qué (inferido)**: es el modo de uso recomendado de Payload 3 con Next.js App Router — permite compartir el mismo build/deploy (Vercel), usar la **Local API** de Payload directamente desde Server Components (sin round-trip HTTP) para renderizar el dashboard del sponsor, y reutilizar un único proceso para admin + API + frontend.
+
+**Consecuencia**: no hay separación de despliegue entre "backend" y "frontend" — un cambio en una colección puede requerir rebuild/redeploy de toda la app. Los límites de Vercel Functions (`vercel.json`) están ajustados por ruta específica para compensar operaciones pesadas del lado de Payload.
+
+## PostgreSQL (Supabase) en vez de MongoDB
+
+**Decisión**: el adaptador de base de datos configurado es `@payloadcms/db-postgres`, no `@payloadcms/db-mongodb`.
+
+**Evidencia de que esto fue un cambio posterior a la plantilla original**: el `README.md` raíz y `docker-compose.yml` siguen describiendo un flujo con **MongoDB** (plantilla oficial "Payload Blank Template"), y `.env.example` todavía documenta `DATABASE_URL=mongodb://...`. Esto indica que el proyecto arrancó desde la plantilla estándar de Payload y migró a Postgres/Supabase sin actualizar esos archivos.
+
+**Por qué Postgres (no confirmado explícitamente, razonamiento del stack)**: Supabase ofrece Postgres administrado + Storage S3-compatible + Auth en una sola plataforma, y el equipo ya usa el resto del ecosistema Supabase para `media`. Con Postgres, además, los IDs son enteros autoincrementales (`db.defaultIDType: number`), más legibles en logs/webhooks que un `ObjectId` de Mongo.
+
+**TODO**: no hay documentación del equipo que explique el motivo exacto de esta elección ni cuándo ocurrió la migración — se infiere únicamente por la inconsistencia entre `payload.config.ts` (fuente de verdad) y los archivos de plantilla desactualizados.
+
+## Conexión directa a Postgres en vez de la API de Supabase (PostgREST)
+
+**Decisión**: Payload usa `pg` (vía `db-postgres`) con una cadena de conexión directa (`DATABASE_URL`), no el cliente JS de Supabase ni PostgREST.
+
+**Consecuencia importante**: como se detalla en [Base de datos](/database#row-level-security-rls), esto significa que **RLS de Supabase no protege estas queries** — todo el control de acceso real depende de la configuración `access` de cada colección de Payload, y la mayoría de colecciones no define ninguna. Esta es probablemente la decisión con mayor impacto en seguridad detectada en el análisis, y no está documentada ni justificada explícitamente en el código — se recomienda revisarla con el equipo.
+
+## Sponsors como colección de autenticación (`auth: true`), no como perfiles vinculados a `users`
+
+**Decisión**: `sponsors` tiene `auth: true` — cada sponsor es una entidad login-able por sí misma, con su propio email/password, en vez de tener una colección `users` genérica con un campo `role` o un perfil `sponsor` vinculado por relación.
+
+**Por qué (inferido)**: simplifica el login (`POST /api/sponsors/login` directo) y el modelo de permisos por diseño de Payload (cada colección `auth` tiene su propio ciclo de vida de sesión/JWT), a costa de tener **dos sistemas de auth paralelos** (`users` para admin interno, `sponsors` para clientes) que no comparten roles ni jerarquía.
+
+**Consecuencia**: no existe (en el código revisado) un mecanismo para que un `user` interno "impersonate" o vea el dashboard como un sponsor específico sin usar las credenciales del sponsor — **TODO**: confirmar si el equipo interno tiene alguna forma de esto o si siempre usan el Admin UI para todo.
+
+## Clonado de datos (snapshot) en vez de solo referencias en vivo
+
+**Decisión**: cuando se asigna un `Plan`/`Event` a un `Sponsor`, sus beneficios/entregables/reuniones se **copian** dentro de `sponsors.eventParticipations[]` (con hooks que luego los mantienen sincronizados), en lugar de que el dashboard del sponsor lea siempre en vivo desde `plans`/`events` vía relación.
+
+**Por qué (inferido del propio código, comentarios en `Sponsors.ts` y `Plans.ts`)**:
+- Permite que cada sponsor tenga **entregables personalizados** (`source: 'custom'`) que coexistan con los del plan, sin afectar a otros sponsors del mismo plan.
+- Permite guardar **estado propio por sponsor** (status `pending`/`completed`/`overdue`, archivos subidos, evidencias) que no tiene sentido modelar en el `Plan` (que es una plantilla compartida).
+- El hook `afterChange` de `Plans` sincroniza cambios hacia todos los sponsors que usan ese plan, pero **respeta explícitamente** los ítems marcados `source: 'custom'` (no los pisa) — es una decisión de diseño deliberada y visible en el código (`if (existing.source === 'custom') return`).
+
+**Consecuencia**: la lógica de sincronización (matching por `planDeliverableId`/`planBenefitItemId`, con fallback por nombre+categoría para datos migrados sin ID estable) es la parte más compleja del código de hooks, y cualquier cambio a la estructura de `benefits[]` en `Plans` debe considerar el impacto en esta sincronización.
+
+## Notificaciones y webhooks como "mejor esfuerzo" (best-effort)
+
+**Decisión**: todos los envíos de email (Resend) y webhooks (n8n) dentro de los hooks `afterChange` de `Sponsors` están envueltos en `try/catch` individuales que solo loguean el error (`console.error`/`console.log`), sin lanzar excepción ni revertir la operación principal.
+
+**Por qué (inferido)**: evita que un servicio externo caído (Resend, n8n) impida guardar cambios legítimos sobre un sponsor — prioriza la disponibilidad de la operación core (guardar datos) sobre la garantía de entrega de notificaciones.
+
+**Consecuencia**: no hay reintentos ni cola de mensajes — si Resend o n8n fallan momentáneamente, la notificación se pierde silenciosamente (solo queda un log). **TODO**: confirmar si existe algún monitoreo de esos logs (Vercel Logs, algún servicio externo) que alerte sobre fallos repetidos.
+
+## `context.skipNotifications` como mecanismo de "actualización silenciosa"
+
+**Decisión**: las actualizaciones a `sponsors` disparadas internamente por otros hooks (por ejemplo, cuando `recursos-globales` sincroniza su array `documents[]`, o cuando `events`/`plans` propagan cambios) pasan `context: { skipNotifications: true }` para que el hook `afterChange` de `Sponsors` no vuelva a disparar emails/webhooks en cascada.
+
+**Por qué (inferido)**: sin este mecanismo, una edición de un `Plan` usado por 50 sponsors dispararía 50 emails y 100+ webhooks a n8n de forma no intencional, y una sincronización de `recursos-globales` podría generar un loop de actualizaciones cruzadas.
+
+**Consecuencia**: es un patrón manual (no hay una convención centralizada tipo "eventos de dominio") — cada hook nuevo que actualice `sponsors` mediante `payload.update()` debe recordar pasar este contexto explícitamente, o reintroducirá notificaciones duplicadas/no deseadas.
+
+## URLs y remitentes hardcodeados en vez de variables de entorno
+
+**Decisión**: el dominio `https://sponsors-hub-ct.vercel.app` (para construir URLs absolutas de archivos hacia n8n) y el remitente de email `Colombia Tech <hola@sponsor.colombiatechweek.co>` están escritos directamente en `src/collections/Sponsors.ts` y `src/app/api/recursos-globales/notify/route.ts`, en vez de leerse de variables de entorno.
+
+**Por qué (no documentado)**: no se encontró justificación en el código o en `AGENTS.md`. Es probable que sea simplemente deuda técnica de un proyecto de un solo entorno de producción conocido.
+
+**Consecuencia**: cambiar de dominio, o tener un entorno de *staging* con un dominio distinto, requiere editar código en vez de configuración. **TODO**: evaluar extraer ambos valores a variables de entorno (`NEXT_PUBLIC_APP_URL`, `EMAIL_FROM`) en una futura refactorización.
+
+## Sin control de acceso (RBAC) granular
+
+**Decisión**: ninguna colección define reglas de `access` por rol más allá de `media.access.read`. No existe un campo `roles` en `users` (a diferencia del ejemplo que trae `AGENTS.md` como buena práctica genérica de Payload).
+
+**Por qué (no documentado)**: posiblemente porque el equipo interno que usa `/admin` es reducido y de confianza total (sin necesidad de diferenciar roles), y los `sponsors` acceden solo a su propio dashboard vía páginas de Next.js que ya filtran por su sesión (no directamente vía API REST/GraphQL cruda).
+
+**Riesgo señalado**: sin `access` control explícito, el comportamiento por defecto de Payload determina si un sponsor autenticado podría, en teoría, consultar o modificar documentos de **otros** sponsors llamando directamente a `/api/sponsors/:id` con su propio token — esto no fue verificado en este análisis (requeriría probarlo contra una instancia corriendo) y se marca como el **TODO de seguridad más importante** de este documento.
+
+## Pipeline de imagen en el navegador (`html-to-image` + `react-easy-crop`) en vez de renderizado en servidor
+
+**Decisión**: las piezas gráficas 1080×1350 de la sección **Artículos** se recortan, componen y exportan **en el cliente**, con `react-easy-crop` para el recorte y `html-to-image` para la captura a PNG — pese a que el proyecto ya tiene `sharp` disponible en el servidor y podría usar algo como Satori/`@vercel/og`.
+
+**Por qué (inferido del código y los commits)**: la pieza es el *mismo* nodo DOM que el usuario ve en el preview, con tipografías, colores por tier y variantes de logo aplicadas en vivo. Capturar ese nodo garantiza que lo exportado sea idéntico a lo previsualizado, sin mantener una segunda plantilla de render en el servidor. Además evita subir al servidor imágenes que puede que el usuario descarte en el modal de recorte.
+
+**Consecuencias**:
+
+- **Límite de subida de Vercel**: como la imagen final se genera en el cliente y viaja de vuelta como upload, hubo que añadir `compressImageForUpload()` para no exceder los ~4.5 MB de cuerpo de request de Vercel Functions (`413`). Ver [Arquitectura](/architecture).
+- **Restricción de CORS heredada**: el `<canvas>` que usa `html-to-image` se contamina con cualquier imagen cross-origin, así que toda imagen debe convertirse a `data:` URL antes de renderizar, y los logos de CTF viven como assets locales en `public/`. Cualquier imagen nueva que se añada a la pieza debe pasar por `toDataUrl()` o la exportación fallará.
+- **Dependencia del navegador del usuario**: la fidelidad del PNG depende del motor de render del cliente. No hay tests automatizados sobre la salida visual — la verificación es manual.
+
+**TODO**: no hay comentario ni commit que descarte explícitamente la alternativa server-side; la razón está inferida del diseño del componente. Si en el futuro se necesita generar estas piezas en lote o desde un webhook (sin navegador), este pipeline no sirve y habría que portar la plantilla a un render de servidor.
+
+## Plantilla original de Payload no limpiada
+
+**Observación (no una decisión deliberada aparente)**: quedan varios artefactos de la plantilla original "Payload Blank Template" sin actualizar o sin eliminar:
+
+- `README.md` describe MongoDB/Docker, no el stack real.
+- `docker-compose.yml` levanta Mongo en vez de Postgres.
+- `.env.example` documenta solo 2 de las ~11 variables realmente necesarias, y con el ejemplo de Mongo.
+- `src/app/my-route/route.ts` es la ruta de ejemplo genérica de la plantilla.
+- `Dockerfile` asume `output: 'standalone'`, que no está configurado en `next.config.ts`.
+
+**Recomendación implícita**: estos archivos deberían actualizarse o eliminarse en una limpieza de deuda técnica, ya que actualmente documentan (o intentan ejecutar) un stack distinto al real.

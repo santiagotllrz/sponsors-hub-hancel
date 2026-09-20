@@ -1,0 +1,83 @@
+---
+title: "Despliegue"
+description: "Cómo y dónde se despliega Sponsors Hub CT"
+---
+
+## Plataforma productiva: Vercel
+
+El proyecto está preparado para desplegarse en **Vercel**:
+
+- Existe una carpeta `.vercel/` (con `project.json`, ignorada por git vía `.gitignore`) que vincula este directorio local a un proyecto de Vercel — evidencia de que el despliegue se gestiona con la CLI/integración de Vercel (`vercel link` / despliegues automáticos por Git).
+- `vercel.json` configura límites específicos de las **Vercel Functions**:
+
+```json
+{
+  "functions": {
+    "src/app/(payload)/api/[...slug]/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "src/app/(frontend)/dashboard/entregables/page.tsx": {
+      "maxDuration": 30
+    }
+  }
+}
+```
+
+  - El catch-all de la API de Payload (`/api/[...slug]`) tiene **60s de duración máxima y 1024 MB de memoria** — más holgado que el default, probablemente porque ahí ocurren operaciones pesadas (subida de archivos a S3, descarga silenciosa de evidencias de Notion en `processNotionEvidences`, hooks que recorren todos los sponsors al editar un `Plan`/`Event`).
+  - La página `/dashboard/entregables` tiene `maxDuration: 30`, más que el default de una página normal — sugiere que su carga (Server Component) hace trabajo no trivial contra la Local API de Payload.
+
+- El código hardcodea el dominio de producción `https://sponsors-hub-ct.vercel.app` en `src/collections/Sponsors.ts` (para construir URLs absolutas de archivos que se envían a n8n). **Si el dominio de producción cambia, este valor debe actualizarse manualmente en el código** — no está parametrizado por variable de entorno. Ver [Decisiones técnicas](/decisions).
+
+### Variables de entorno en Vercel
+
+Todas las variables listadas en [Instalación](/setup#variables-de-entorno) deben configurarse en el dashboard de Vercel (Project Settings → Environment Variables) para los entornos que correspondan (Production/Preview/Development). No hay un archivo de configuración de entornos de Vercel en el repo más allá de `vercel.json` (que solo define límites de funciones, no variables).
+
+**TODO**: no se pudo confirmar desde el repo si existen variables distintas para Preview vs Production (por ejemplo, un bucket S3 o base de datos de staging separados) — esto vive en la configuración del dashboard de Vercel, fuera del alcance de este repositorio.
+
+## Build de producción
+
+```bash
+pnpm build   # cross-env NODE_OPTIONS="--no-deprecation --max-old-space-size=8000" next build
+pnpm start   # next start
+```
+
+El build aumenta el heap de Node a 8 GB (`--max-old-space-size=8000`), lo que sugiere que el build de Payload + Next.js es intensivo en memoria (colecciones con estructuras profundamente anidadas como `sponsors.eventParticipations`, generación de tipos, etc.).
+
+## Despliegue vía Docker (alternativa, no confirmada en uso)
+
+El repo incluye un `Dockerfile` multi-stage (`deps` → `builder` → `runner`) siguiendo el patrón oficial de Next.js para `output: 'standalone'`.
+
+<Warning>
+**Inconsistencia detectada**: el propio `Dockerfile` indica en su primer comentario que requiere `output: 'standalone'` en la configuración de Next.js, pero `next.config.ts` (revisado en este análisis) **no** define esa opción. Tal como está, el `Dockerfile` fallaría al intentar copiar `.next/standalone`, que no se generaría. **TODO**: confirmar si el equipo usa Docker en algún entorno real (staging propio, on-prem) — si es así, hay que agregar `output: 'standalone'` a `next.config.ts`; si no se usa, este Dockerfile es un remanente de la plantilla original y podría eliminarse o marcarse como no soportado.
+</Warning>
+
+`docker-compose.yml` también está desalineado con el stack real: levanta **MongoDB**, mientras que la base de datos configurada en `payload.config.ts` es **PostgreSQL** (Supabase). Ver [Decisiones técnicas](/decisions) para el detalle.
+
+## Servicios externos que deben estar disponibles en producción
+
+| Servicio | Qué pasa si no está configurado/disponible |
+|---|---|
+| Supabase Postgres (`DATABASE_URL`) | La aplicación no arranca — es la base de datos primaria de Payload. |
+| Supabase Storage / S3 (`S3_*`) | Fallan las subidas y lecturas de la colección `media` (logos, evidencias, entregables, piezas de RRSS). |
+| Resend (`RESEND_API_KEY`) | Los emails transaccionales fallan silenciosamente (los hooks atrapan el error en `try/catch` y solo loguean a consola) — el guardado de datos no se ve afectado. |
+| n8n (`N8N_WEBHOOK_*`) | Si las URLs no están definidas, esos webhooks simplemente no se disparan (chequeo `if (webhookUrl)` antes de cada `fetch`); si están definidas pero el servicio no responde, el error se captura y loguea sin afectar el guardado del sponsor. |
+
+En todos los casos anteriores, los fallos de servicios externos están diseñados para **no bloquear** la operación principal sobre Payload/Postgres (guardar un sponsor, un plan, etc.) — son "mejores esfuerzos" (*best effort*) envueltos en `try/catch`.
+
+## Checklist de despliegue (inferido del código, no documentado explícitamente por el equipo)
+
+<Steps>
+  <Step title="Variables de entorno">
+    Configurar en Vercel todas las variables de [Instalación](/setup#variables-de-entorno): `DATABASE_URL`, `PAYLOAD_SECRET`, `RESEND_API_KEY`, `S3_*`, y opcionalmente `N8N_WEBHOOK_*`.
+  </Step>
+  <Step title="Dominio">
+    Si el dominio de producción cambia de `sponsors-hub-ct.vercel.app`, actualizar el string hardcodeado en `src/collections/Sponsors.ts` (usado para las URLs de logo enviadas a n8n).
+  </Step>
+  <Step title="Dominio de email verificado en Resend">
+    Confirmar que `sponsor.colombiatechweek.co` está verificado en Resend, ya que el remitente `hola@sponsor.colombiatechweek.co` está hardcodeado en varios hooks y no es configurable por entorno.
+  </Step>
+  <Step title="Deploy">
+    Push a la rama conectada al proyecto de Vercel (o `vercel deploy` con la CLI) — Vercel corre `pnpm build` automáticamente.
+  </Step>
+</Steps>

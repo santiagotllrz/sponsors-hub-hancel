@@ -1,0 +1,55 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Sponsors Hub CT",
+  "description": "Documentación técnica del portal de gestión de patrocinadores de Colombia Tech Week",
+  "colors": {
+    "primary": "#171717",
+    "light": "#fafafa",
+    "dark": "#0a0a0a"
+  },
+  "favicon": "/favicon.ico",
+  "logo": {
+    "light": "/logo/logo.png",
+    "dark": "/logo/logo.png"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentación",
+        "groups": [
+          {
+            "group": "Empezando",
+            "pages": [
+              "introduction",
+              "setup"
+            ]
+          },
+          {
+            "group": "Sistema",
+            "pages": [
+              "architecture",
+              "database",
+              "api-reference"
+            ]
+          },
+          {
+            "group": "Operación",
+            "pages": [
+              "deployment",
+              "decisions"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Repositorio",
+        "href": "https://github.com/santiagotellez-ct/sponsors-hub-ct"
+      }
+    ]
+  }
+}

@@ -1,0 +1,53 @@
+---
+title: "Introducción"
+description: "Qué es Sponsors Hub CT, qué problema resuelve y con qué stack está construido"
+---
+
+## Qué es
+
+**Sponsors Hub CT** es la aplicación interna de **Colombia Tech Week** para gestionar patrocinadores (sponsors) de sus eventos. Es una aplicación **Next.js 16** que embebe **Payload CMS 3** como backend/admin, y expone dos superficies:
+
+- Un **panel de administración** (Payload Admin, personalizado) usado por el equipo interno / Customer Success.
+- Un **dashboard de cliente** (`/dashboard/*`) al que cada sponsor accede con su propia cuenta.
+
+## Qué problema resuelve
+
+Cada sponsor de un evento contrata un **Plan** (tier) que define:
+
+- **Beneficios**: ítems que el equipo de Colombia Tech Week debe ejecutar para el sponsor (por ejemplo, "logo en el stage", "mención en redes").
+- **Entregables**: contenido que el propio sponsor debe subir (logo, textos, formularios, links, etc.), con fecha límite y, opcionalmente, fecha de habilitación.
+
+Antes de este sistema, ese seguimiento vivía disperso (Notion, hojas de cálculo, WhatsApp, Google Drive). Sponsors Hub CT centraliza:
+
+- El alta de sponsors con acceso propio (login) a un dashboard donde ven su progreso.
+- La **clonación automática** de beneficios, entregables y reuniones desde el Plan y el Evento asignado hacia cada Sponsor al momento de asignarlos.
+- La **sincronización continua** de esos datos si el Plan o el Evento cambian después de la asignación inicial.
+- La subida de **evidencias** de cumplimiento (imágenes, documentos, texto, links) por parte del equipo interno, y la subida de **entregables** por parte del sponsor.
+- **Notificaciones por correo** (bienvenida, nueva evidencia, nuevo recurso/pieza) vía Resend.
+- **Webhooks salientes hacia n8n** para sincronizar datos con Notion y Google Drive.
+
+## Stack técnico
+
+| Capa | Tecnología |
+|---|---|
+| Framework | Next.js 16 (App Router, React 19) |
+| CMS / Backend | Payload CMS 3.82 (`buildConfig`, colecciones, hooks, API REST + GraphQL autogeneradas) |
+| Base de datos | PostgreSQL (`@payloadcms/db-postgres`), alojada en Supabase |
+| Almacenamiento de archivos | S3-compatible (`@payloadcms/storage-s3`), apuntando al Storage de Supabase (`forcePathStyle: true`) |
+| Editor de texto enriquecido | Lexical (`@payloadcms/richtext-lexical`) |
+| Envío de correo | Resend (`resend` + plantillas `@react-email/components`) |
+| Automatización externa | n8n vía webhooks salientes (HTTP POST) |
+| UI | Tailwind CSS 4, shadcn/ui (Radix UI), lucide-react |
+| Procesamiento de imágenes (servidor) | `sharp` |
+| Generación de imágenes (navegador) | `html-to-image` (captura DOM → PNG 1080×1350), `react-easy-crop` (recorte interactivo), `<canvas>` nativo para compresión previa a la subida |
+| Testing | Vitest (integración) + Playwright (e2e) |
+| Despliegue | Vercel (`vercel.json`, `.vercel/`); también soporta Docker/`docker-compose` para desarrollo local |
+| Lenguaje | TypeScript, estricto (`strict: true` en `tsconfig.json`) |
+
+<Note>
+El proyecto nace de la plantilla oficial "Payload Blank Template" (ver `README.md` original) y fue extendido con el dominio de negocio de patrocinios. El `README.md` raíz aún describe el flujo genérico de la plantilla (MongoDB, Docker) y no refleja el stack real en producción (Postgres + S3 de Supabase) — ver [Decisiones técnicas](/decisions) para más contexto.
+</Note>
+
+## Público de esta documentación
+
+Esta documentación está dirigida a quien mantenga o extienda el código: desarrolladores del equipo de Colombia Tech Week o colaboradores externos que necesiten entender la arquitectura, el modelo de datos y los servicios conectados sin tener que leer todo el código fuente primero.

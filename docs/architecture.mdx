@@ -1,0 +1,153 @@
+---
+title: "Arquitectura"
+description: "Cómo encajan Next.js, Payload CMS, Supabase, Resend y n8n"
+---
+
+## Visión general
+
+Sponsors Hub CT es una **aplicación monolítica Next.js** que embebe **Payload CMS** en el mismo proceso (no hay un backend separado). Payload se monta dentro del App Router mediante `withPayload()` (`next.config.ts`) y expone su Admin UI, su API REST y su API GraphQL como rutas de Next.js dentro del grupo `src/app/(payload)/`.
+
+```mermaid
+flowchart TB
+    subgraph Cliente["Navegador"]
+        SponsorUser["Sponsor (dashboard)"]
+        AdminUser["Equipo interno (admin)"]
+    end
+
+    subgraph Vercel["Vercel — Next.js 16 (App Router)"]
+        direction TB
+        MW["middleware.ts\n(protección de /dashboard vía cookie payload-token)"]
+
+        subgraph Frontend["src/app/(frontend)"]
+            Login["/ (login)"]
+            Dashboard["/dashboard/*\n(planes, entregables, reuniones,\ncalendario, redes-sociales, documentos)"]
+        end
+
+        subgraph PayloadApp["src/app/(payload)"]
+            AdminUI["/admin\n(Payload Admin UI personalizado)"]
+            REST["/api/[...slug]\n(REST autogenerado por colección)"]
+            GQL["/api/graphql + /api/graphql-playground"]
+        end
+
+        subgraph CustomAPI["Endpoints custom"]
+            DupPlan["POST /api/duplicate-plan"]
+            NotifyRG["POST /api/recursos-globales/notify"]
+        end
+
+        Core["payload.config.ts\nColecciones + Hooks\n(Sponsors, Events, Plans, Forms,\nPiezasRedesSociales, RecursosGlobales, Media, Users)"]
+    end
+
+    subgraph Supabase["Supabase"]
+        PG[("PostgreSQL\n(db-postgres adapter)")]
+        S3["Storage S3-compatible\n(bucket de media)"]
+    end
+
+    subgraph External["Servicios externos"]
+        Resend["Resend\n(emails transaccionales)"]
+        N8N["n8n\n(automatización / Notion / Drive)"]
+    end
+
+    SponsorUser -->|login + navegación| MW
+    AdminUser -->|acceso admin| AdminUI
+    MW --> Login
+    MW --> Dashboard
+    Dashboard -->|Payload Local API| Core
+    Login -->|POST /api/sponsors/login| REST
+    AdminUI --> Core
+    REST --> Core
+    GQL --> Core
+    DupPlan --> Core
+    NotifyRG --> Core
+    NotifyRG -->|resend.emails.send| Resend
+
+    Core -->|db-postgres pool| PG
+    Core -->|storage-s3 plugin| S3
+    Core -->|afterChange hooks: resend.emails.send| Resend
+    Core -->|afterChange hooks: fetch webhook POST| N8N
+```
+
+## Componentes principales
+
+### 1. Next.js App Router
+
+- **`src/app/(frontend)/`** — rutas públicas: login (`/`) y el dashboard del sponsor (`/dashboard/*`). Son Server Components que leen la cookie `payload-token`, autentican contra Payload (`payload.auth(...)`) y redirigen a `/` si no hay sesión válida.
+- **`src/app/(payload)/`** — rutas generadas/gestionadas por Payload: el Admin UI (`/admin`), el REST catch-all (`/api/[...slug]`) y GraphQL (`/api/graphql`, `/api/graphql-playground`). Estos archivos de ruta son generados automáticamente por Payload y no deben editarse a mano (llevan el comentario `THIS FILE WAS GENERATED AUTOMATICALLY BY PAYLOAD`).
+- **`middleware.ts`** — capa adicional de protección de rutas a nivel de Next.js: redirige a `/` cualquier request a `/dashboard/*` sin cookie `payload-token`, y redirige a `/dashboard` cualquier request a `/` que ya tenga token.
+- **Endpoints custom** fuera del CRUD autogenerado: `POST /api/duplicate-plan` y `POST /api/recursos-globales/notify` (ver [API Reference](/api-reference)).
+
+### 2. Payload CMS (`src/payload.config.ts`)
+
+Es el núcleo de la aplicación: define las 8 colecciones de negocio/sistema, el editor de texto enriquecido (Lexical), el adaptador de base de datos, el plugin de almacenamiento S3 y las personalizaciones del Admin UI (logo, vistas custom, componentes de campo custom). Ver [Base de datos](/database) para el detalle de cada colección.
+
+La lógica de negocio (clonado de beneficios/entregables, sincronización Plan↔Sponsor, envío de emails, disparo de webhooks) vive en **hooks de colección** (`beforeChange`, `afterChange`), no en servicios o controladores separados — es el patrón nativo de Payload.
+
+### 3. Autenticación
+
+Hay **dos colecciones con auth habilitado**:
+
+- `users` (`auth: { useAPIKey: true }`) — usuarios internos del admin, con soporte de API Key además de login por sesión.
+- `sponsors` (`auth: true`) — cada sponsor es, literalmente, un usuario autenticable de Payload. El login del dashboard llama directamente a `POST /api/sponsors/login` (endpoint de auth autogenerado por Payload para la colección `sponsors`), y Payload responde seteando la cookie httpOnly `payload-token`.
+
+No hay un sistema de roles/RBAC explícito (no se encontró un campo `roles` en `Users` ni funciones de `access` personalizadas en la mayoría de colecciones, más allá de `Media.access.read`). <br />
+**TODO**: confirmar si esto es intencional (acceso "todo o nada" dentro del admin) o si falta definir `access` control por colección — no está documentado en el código ni en `AGENTS.md`.
+
+### 4. Base de datos — Supabase Postgres
+
+Payload se conecta directamente a Postgres vía `@payloadcms/db-postgres` (que usa `pg` internamente) usando la cadena `DATABASE_URL`. Esto es una **conexión directa a Postgres**, no a través de la API PostgREST de Supabase — por lo tanto **Row Level Security (RLS) de Supabase no aplica** a este flujo (Payload aplica su propio control de acceso a nivel de aplicación, si está definido). Ver [Base de datos](/database) para más detalle.
+
+### 5. Almacenamiento de archivos — Supabase Storage (S3-compatible)
+
+El plugin `@payloadcms/storage-s3` intercepta la colección `media` y sube los archivos al bucket S3 configurado (`S3_BUCKET`) usando el endpoint S3-compatible de Supabase Storage (`S3_ENDPOINT`), con `forcePathStyle: true` (requisito explícito de Supabase, documentado en un comentario del propio `payload.config.ts`).
+
+### 6. Emails transaccionales — Resend
+
+Se usa el SDK `resend` directamente dentro de los hooks `afterChange` de `Sponsors` y en los endpoints custom, con plantillas React Email (`src/emails/*.tsx`). El remitente está hardcodeado: `Colombia Tech <hola@sponsor.colombiatechweek.co>`.
+
+### 7. Automatización externa — n8n
+
+Tres webhooks salientes (HTTP POST, disparados con `fetch`) desde el hook `afterChange` de `Sponsors`:
+
+- `N8N_WEBHOOK_URL` — sincroniza el perfil completo del sponsor (contacto, estrategia, eventos, planes, logo) hacia Notion.
+- `N8N_WEBHOOK_REUNIONES_URL` — notifica cambios de reuniones (solo envía `sponsorId`).
+- `N8N_WEBHOOK_DRIVE_URL` — cuando se sube un entregable cuyo nombre contiene "logo", envía la URL pública del archivo para que n8n lo suba a Google Drive.
+
+No hay webhooks entrantes (Sponsors Hub CT no expone endpoints para que n8n le escriba de vuelta) — la relación es unidireccional, saliente.
+
+### 8. Generación de imágenes en el navegador — Artículos de sponsor
+
+La sección **Artículos** del admin (`src/components/admin/ArticulosClient.tsx`, colección `sponsor-articles`) arma una pieza gráfica de **1080×1350 px** para redes a partir de una foto, el logo del sponsor y el logo de CTF. Todo el pipeline de imagen corre **en el cliente**, no en el servidor, y se apoya en dos dependencias añadidas para esto:
+
+| Paquete | Versión | Para qué se usa |
+|---|---|---|
+| [`react-easy-crop`](https://github.com/ValentinH/react-easy-crop) | `^6.2.2` | Modal de recorte interactivo (arrastrar + zoom 1×–3×) con `aspect={1080/1350}`, al elegir una foto nueva. |
+| [`html-to-image`](https://github.com/bubkoo/html-to-image) | `^1.11.13` | Captura el nodo DOM del preview y lo serializa a un `Blob` PNG de 1080×1350 para descargar. |
+
+El flujo completo tiene cuatro pasos, y cada uno existe por una restricción concreta:
+
+<Steps>
+  <Step title="Recorte — react-easy-crop">
+    `CropModal` solo produce coordenadas; el recorte real lo hace `cropImageToCanvas()`, que dibuja el `croppedAreaPixels` (coordenadas en píxeles de la imagen original, no CSS) sobre un `<canvas>` offscreen y lo re-lee como JPEG de calidad `0.92`. Se hizo así a propósito: la aproximación por transformación CSS daba un resultado distinto al que el usuario veía en el modal (commit `c8811a9`).
+  </Step>
+  <Step title="Compresión antes de subir — canvas nativo">
+    `compressImageForUpload()` (`src/lib/compress-image-for-upload.ts`) reescala la imagen (el editor de Artículos le pasa `maxWidth: 1080, maxHeight: 1350`; por defecto el helper usa 2160×2700) y baja la calidad JPEG en pasos de `0.08` hasta quedar bajo **4 MB** (`UPLOAD_MAX_BYTES`). Es necesario porque **Vercel Functions rechaza cuerpos de request de más de ~4.5 MB** con un `413`; sin esto, subir una foto de cámara fallaba (commit `68d80c8`). Si ni al 45% de calidad baja del límite, lanza un error legible en vez de intentar la subida.
+  </Step>
+  <Step title="Normalización a data: URL — evitar canvas taint">
+    `html-to-image` lee las imágenes del nodo capturado a través de un `<canvas>`, y el canvas se marca como *tainted* (y `toBlob` lanza) si alguna imagen es **cross-origin**: media de Supabase, logos de sponsor en CDN externo. Por eso `toDataUrl()` hace `fetch` + `FileReader` de cada imagen **antes** de renderizar el preview, de modo que el canvas solo vea fuentes `data:` (mismo origen). Por la misma razón el logo blanco de CTF se sirve como asset local en `public/Logo-CTF-Blanco.png` en vez de enlazarse desde fuera (commit `02c42c0`).
+  </Step>
+  <Step title="Captura a PNG — html-to-image">
+    `captureFullResPng()` escala temporalmente el preview (`transform: scale(2)`, wrapper a 1080×1350), espera dos `requestAnimationFrame` para que el navegador aplique la transformación, llama a `toBlob(node, { width: 1080, height: 1350, pixelRatio: 1 })` y **restaura los estilos previos en un `finally`**. El `Blob` se descarga como `<slug>-1080x1350.png`.
+  </Step>
+</Steps>
+
+<Warning>
+Ambas dependencias son **solo de navegador** (dependen de `document`, `<canvas>`, `FileReader`, `Image`). `ArticulosClient.tsx` lleva `'use client'` y no debe importarse desde un Server Component ni desde un hook de Payload — no hay equivalente server-side en este flujo; `sharp` sigue usándose únicamente para el procesamiento de uploads del lado de Payload.
+</Warning>
+
+## Flujo de datos típico: alta y seguimiento de un sponsor
+
+1. El equipo interno crea un `Sponsor` desde el Admin UI, asignándole un `Event` y un `Plan` dentro de `eventParticipations[]`.
+2. El hook `beforeChange` de `Sponsors` clona automáticamente las `meetings` (desde `event.meetingTemplates`) y los `deliverables`/`benefitItems` (desde `plan.benefits`).
+3. El hook `afterChange` de `Sponsors` envía el email de bienvenida (Resend) con la contraseña temporal, y dispara los webhooks hacia n8n.
+4. El sponsor inicia sesión en `/` (`POST /api/sponsors/login`) y navega su dashboard (`/dashboard/*`), donde ve su plan, entregables, reuniones y calendario.
+5. El sponsor sube un entregable o el equipo interno sube una evidencia → el hook `afterChange` de `Sponsors` detecta el cambio y envía el email correspondiente ("nueva evidencia", "nuevo recurso", "nueva pieza de redes sociales").
+6. Si el `Plan` o el `Event` asignado se edita después, sus respectivos hooks `afterChange` recorren todos los sponsors afectados y sincronizan los cambios (sin pisar personalizaciones marcadas `source: 'custom'`).

@@ -1,0 +1,246 @@
+---
+title: "Referencia de API"
+description: "Endpoints REST autogenerados por Payload, GraphQL y endpoints custom"
+---
+
+<Note>
+Los ejemplos de request/response de esta página están construidos a partir del schema real de las colecciones (`src/collections/*.ts`, `src/payload-types.ts`) y de las convenciones documentadas de Payload REST API. No se capturó tráfico real contra un servidor corriendo — los valores de ejemplo (nombres, IDs) son ilustrativos. Donde el comportamiento no está confirmado en el código, se marca con **TODO**.
+</Note>
+
+## Autenticación
+
+Todas las rutas bajo `/api/*` (excepto las marcadas como públicas) requieren autenticación vía cookie httpOnly `payload-token` (seteada automáticamente por Payload al hacer login) o un header `Authorization: JWT <token>`.
+
+### `POST /api/sponsors/login`
+
+Endpoint de autenticación autogenerado por Payload para la colección `sponsors` (`auth: true`). Usado por `src/components/login-form.tsx`.
+
+**Request**
+
+```json
+{
+  "email": "contacto@empresa.com",
+  "password": "••••••••"
+}
+```
+
+**Response `200`**
+
+```json
+{
+  "message": "Auth Passed",
+  "user": {
+    "id": 12,
+    "email": "contacto@empresa.com",
+    "companyName": "Empresa S.A.S",
+    "collection": "sponsors"
+  },
+  "token": "<jwt>",
+  "exp": 1234567890
+}
+```
+
+Además del body, Payload setea la cookie `payload-token` (httpOnly) en la respuesta — es lo que consume `middleware.ts` y las páginas de `/dashboard/*` para verificar sesión.
+
+**Response `401`** (credenciales inválidas) — el frontend muestra `data.message` como error (ver `login-form.tsx`).
+
+### `POST /api/users/login`
+
+Análogo al anterior, pero para la colección `users` (equipo interno / admin). Usado internamente por el Admin UI de Payload.
+
+### Otros endpoints de auth autogenerados
+
+Payload genera automáticamente, para toda colección con `auth` habilitado (`sponsors` y `users`), el siguiente set adicional de rutas — **TODO: no se encontró un consumidor explícito de estas rutas en el código del frontend actual (más allá del login), se listan por ser comportamiento estándar del framework**:
+
+| Ruta | Método | Propósito |
+|---|---|---|
+| `/api/{collection}/logout` | `POST` | Invalida la sesión / limpia la cookie |
+| `/api/{collection}/me` | `GET` | Devuelve el usuario autenticado actual |
+| `/api/{collection}/refresh-token` | `POST` | Renueva el JWT |
+| `/api/{collection}/forgot-password` | `POST` | Dispara flujo de recuperación de contraseña |
+| `/api/{collection}/reset-password` | `POST` | Aplica nueva contraseña con token |
+| `/api/{collection}/unlock` | `POST` | Desbloquea cuenta tras `loginAttempts` excedidos |
+
+## REST API autogenerada (CRUD por colección)
+
+Payload expone REST estándar para cada colección declarada en `payload.config.ts` (`users`, `media`, `sponsors`, `events`, `plans`, `forms`, `piezas-redes-sociales`, `recursos-globales`), servido por el catch-all `src/app/(payload)/api/[...slug]/route.ts`.
+
+| Ruta | Método | Descripción |
+|---|---|---|
+| `/api/{collection}` | `GET` | Lista documentos (soporta `where`, `limit`, `page`, `depth`, `sort` como query params) |
+| `/api/{collection}` | `POST` | Crea un documento |
+| `/api/{collection}/:id` | `GET` | Obtiene un documento por ID |
+| `/api/{collection}/:id` | `PATCH` | Actualiza un documento |
+| `/api/{collection}/:id` | `DELETE` | Elimina un documento |
+| `/api/{collection}/:id` | `PUT` | Reemplaza un documento (soporte genérico de Payload) |
+
+### Ejemplo: `GET /api/sponsors?depth=1&limit=10`
+
+**Response `200`** (estructura basada en el `Sponsor` de `src/payload-types.ts`)
+
+```json
+{
+  "docs": [
+    {
+      "id": 12,
+      "companyName": "Empresa S.A.S",
+      "eventsSummary": "Colombia Tech Week 2026 (actual)",
+      "currentPlanName": "Gold",
+      "contactInfo": {
+        "fullName": "Nombre Apellido",
+        "corporateEmail": "contacto@empresa.com",
+        "whatsapp": "+57...",
+        "linkedin": "https://linkedin.com/company/empresa"
+      },
+      "eventParticipations": [
+        {
+          "isCurrent": true,
+          "event": 3,
+          "plan": 2,
+          "deliverables": [ /* ... */ ],
+          "benefitItems": [ /* ... */ ]
+        }
+      ],
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-02T00:00:00.000Z"
+    }
+  ],
+  "totalDocs": 1,
+  "limit": 10,
+  "page": 1,
+  "totalPages": 1,
+  "hasNextPage": false,
+  "hasPrevPage": false
+}
+```
+
+`depth` controla cuántos niveles de relaciones se resuelven (`event`, `plan`, `logo`, `uploadedFile`, etc. pasan de ser un `number` (ID) a un objeto completo).
+
+### Ejemplo: `PATCH /api/sponsors/12`
+
+Usado, por ejemplo, cuando el equipo interno sube una evidencia dentro de `eventParticipations[].benefitItems[].evidences[]`, o cuando el propio sponsor sube un entregable. Este PATCH es el que dispara toda la cadena de hooks `afterChange` descrita en [Arquitectura](/architecture) (emails + webhooks a n8n), salvo que la request incluya `context.skipNotifications` (solo posible vía Local API, no vía REST público).
+
+**Request** (ejemplo parcial — agregar una evidencia)
+
+```json
+{
+  "eventParticipations": [
+    {
+      "event": 3,
+      "plan": 2,
+      "benefitItems": [
+        {
+          "itemName": "Logo en pantalla principal",
+          "status": "in_progress",
+          "evidences": [
+            { "type": "image", "file": 45 }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Response `200`**: el documento `Sponsor` actualizado completo (mismo shape que el `GET`).
+
+### GraphQL
+
+- `POST /api/graphql` — API GraphQL autogenerada (`src/app/(payload)/api/graphql/route.ts`, usa `GRAPHQL_POST` de `@payloadcms/next/routes`).
+- `GET /api/graphql-playground` — IDE interactivo de GraphQL (`src/app/(payload)/api/graphql-playground/route.ts`).
+
+**TODO**: no se encontró ningún consumidor de GraphQL en el frontend actual (`src/app/(frontend)`, `src/components`) — el frontend usa exclusivamente REST (`fetch` directo o la Local API de Payload dentro de Server Components). GraphQL parece estar disponible pero sin uso activo confirmado.
+
+## Endpoints custom
+
+### `POST /api/duplicate-plan`
+
+`src/app/(payload)/api/duplicate-plan/route.ts`. Duplica un `Plan` completo (incluyendo su árbol de `benefits[]`), quitando los IDs internos para que Payload genere unos nuevos, y agrega el sufijo `" (Copia)"` al nombre. Invocado desde el botón custom del admin `DuplicatePlanButton` (`beforeListTable` de la colección `plans`).
+
+**Request**
+
+```json
+{ "id": 2 }
+```
+
+**Response `200`**
+
+```json
+{ "success": true, "id": 9 }
+```
+
+**Response `400`** — falta `id`:
+```json
+{ "error": "id requerido" }
+```
+
+**Response `404`** — el plan no existe:
+```json
+{ "error": "Plan no encontrado" }
+```
+
+**Response `500`**:
+```json
+{ "error": "Error al duplicar" }
+```
+
+<Info>
+Este endpoint no valida autenticación/autorización explícitamente en su propio código (usa `getPayload({ config: configPromise })` con la Local API, que **bypassa el control de acceso por defecto** salvo que se pase `overrideAccess: false`). No se llama con `overrideAccess: false` en el código, por lo que la única barrera de acceso real es que la ruta esté detrás del Admin UI protegido. **TODO**: confirmar si este endpoint debería restringirse explícitamente a usuarios admin autenticados.
+</Info>
+
+### `POST /api/recursos-globales/notify`
+
+`src/app/api/recursos-globales/notify/route.ts`. Envía un email (Resend) a todos los sponsors asignados a un `RecursoGlobal`, con asunto y cuerpo personalizables. Invocado desde el componente custom `RecursosGlobalesNotify` en el campo `notifySponsors` de la colección `recursos-globales`.
+
+**Request**
+
+```json
+{
+  "recursoId": "7",
+  "subject": "Tienes un nuevo recurso disponible",
+  "body": "Texto opcional personalizado del correo"
+}
+```
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "sent": 4,
+  "failed": 0
+}
+```
+
+Si `errors.length > 0`, la respuesta incluye además `failedIds: string[]` con los IDs de sponsors a los que falló el envío.
+
+**Response `400`** — faltan `recursoId` o `subject`:
+```json
+{ "error": "recursoId y subject son requeridos" }
+```
+
+**Response `404`** — el recurso no existe:
+```json
+{ "error": "Recurso no encontrado" }
+```
+
+**Response `200`** (caso sin sponsors asignados):
+```json
+{ "success": true, "sent": 0, "message": "Sin sponsors asignados" }
+```
+
+### `GET /my-route`
+
+`src/app/my-route/route.ts` — ruta de ejemplo dejada por la plantilla original de Payload, no forma parte de la funcionalidad de negocio.
+
+```json
+{ "message": "This is an example of a custom route." }
+```
+
+<Warning>
+**TODO**: evaluar si `/my-route` debe eliminarse del código en limpieza futura — parece un residuo de la plantilla (`payload-blank-template`) sin uso real.
+</Warning>
+
+## Webhooks salientes (no son endpoints de este servicio)
+
+Sponsors Hub CT **no expone** endpoints para recibir callbacks de n8n — solo actúa como cliente, haciendo `fetch(..., { method: 'POST' })` hacia las URLs configuradas en `N8N_WEBHOOK_URL`, `N8N_WEBHOOK_REUNIONES_URL` y `N8N_WEBHOOK_DRIVE_URL`. Ver [Arquitectura](/architecture#7-automatización-externa--n8n) para el detalle de los payloads enviados.

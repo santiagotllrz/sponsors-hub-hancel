@@ -1,0 +1,120 @@
+---
+title: "Instalación y entorno local"
+description: "Requisitos, variables de entorno y cómo levantar el proyecto en local"
+---
+
+## Requisitos
+
+Definidos en `package.json` → `engines`:
+
+- **Node.js**: `^18.20.2` o `>=20.9.0`
+- **pnpm**: `^9` o `^10` (gestor de paquetes del proyecto — hay `pnpm-lock` implícito por `.npmrc`/scripts, aunque el lockfile presente en el repo es `package-lock.json`).
+
+<Note>
+El repo trae tanto `package-lock.json` como scripts pensados para `pnpm` (`pnpm dev`, `pnpm install && pnpm dev` en `docker-compose.yml`). **TODO**: confirmar cuál es el gestor de paquetes oficial del equipo — el `README.md` y `docker-compose.yml` asumen `pnpm`, pero el lockfile versionado es de npm.
+</Note>
+
+`.npmrc` fija `legacy-peer-deps=true` y `.yarnrc` fija `--install.ignore-engines true` (para tolerar conflictos de peer dependencies, comunes en el ecosistema Payload + React 19).
+
+## Variables de entorno
+
+No hay validación de esquema de entorno (no se usa `zod`/`t3-env` ni similar) — las variables se leen directo de `process.env` en `payload.config.ts` y en las colecciones/rutas que las necesitan.
+
+`.env.example` solo documenta el mínimo de la plantilla original de Payload:
+
+```bash
+DATABASE_URL=mongodb://127.0.0.1/your-database-name
+PAYLOAD_SECRET=YOUR_SECRET_HERE
+```
+
+Pero el proyecto real (según `payload.config.ts` y las colecciones) requiere estas variables adicionales:
+
+| Variable | Requerida | Usada en | Descripción |
+|---|---|---|---|
+| `DATABASE_URL` | Sí | `payload.config.ts` | Cadena de conexión a PostgreSQL (Supabase). **No** es una URL de MongoDB pese a lo que sugiere `.env.example`. |
+| `PAYLOAD_SECRET` | Sí | `payload.config.ts` | Secreto usado por Payload para firmar JWT/cookies de sesión. |
+| `RESEND_API_KEY` | Sí (para que funcionen los emails) | `src/collections/Sponsors.ts`, `src/app/api/recursos-globales/notify/route.ts` | API key de Resend. Si falta, el cliente de Resend se instancia igual pero los envíos fallarán silenciosamente (los hooks atrapan el error con `try/catch` y solo loguean). |
+| `S3_BUCKET` | Sí (para uploads) | `payload.config.ts` | Nombre del bucket S3 (Supabase Storage) para la colección `media`. |
+| `S3_ACCESS_KEY_ID` | Sí | `payload.config.ts` | Access key del bucket S3. |
+| `S3_SECRET_ACCESS_KEY` | Sí | `payload.config.ts` | Secret key del bucket S3. |
+| `S3_REGION` | Sí | `payload.config.ts` | Región del bucket. |
+| `S3_ENDPOINT` | Sí | `payload.config.ts` | Endpoint S3-compatible de Supabase Storage. |
+| `N8N_WEBHOOK_URL` | No (opcional) | `src/collections/Sponsors.ts` | Si está definida, sincroniza el perfil del sponsor hacia n8n/Notion en cada `update`. Si falta, ese webhook simplemente no se dispara. |
+| `N8N_WEBHOOK_REUNIONES_URL` | No (opcional) | `src/collections/Sponsors.ts` | Webhook de sincronización de reuniones. |
+| `N8N_WEBHOOK_DRIVE_URL` | No (opcional) | `src/collections/Sponsors.ts` | Webhook de subida de logo a Google Drive. |
+
+<Warning>
+`.env` no está versionado (está en `.gitignore`) y contiene credenciales reales del proyecto. Nunca lo commitees ni lo pegues en logs o issues.
+</Warning>
+
+## Instalación local
+
+<Steps>
+  <Step title="Clonar e instalar dependencias">
+    ```bash
+    pnpm install
+    ```
+  </Step>
+  <Step title="Configurar variables de entorno">
+    Copia `.env.example` a `.env` y completa **todas** las variables listadas arriba (no solo las dos que trae la plantilla). Necesitarás acceso al proyecto de Supabase (Postgres + Storage) y a las API keys de Resend / n8n del equipo.
+    ```bash
+    cp .env.example .env
+    ```
+  </Step>
+  <Step title="Levantar el servidor de desarrollo">
+    ```bash
+    pnpm dev
+    ```
+    Next.js corre con `NODE_OPTIONS=--no-deprecation` (ver script `dev` en `package.json`). Abre `http://localhost:3000`.
+  </Step>
+  <Step title="Crear el primer usuario admin">
+    La primera vez, Payload te guiará para crear el primer usuario de la colección `users` desde `/admin`.
+  </Step>
+</Steps>
+
+### Comando alternativo: `devsafe`
+
+```bash
+pnpm devsafe
+```
+
+Borra la carpeta `.next` antes de arrancar (`rm -rf .next && ... next dev`) — útil si hay problemas de caché de build.
+
+## Docker (opcional, desactualizado)
+
+`docker-compose.yml` levanta un contenedor Node genérico junto a un contenedor **MongoDB**, siguiendo la plantilla original de Payload. **Esto no coincide con el stack real del proyecto**, que usa PostgreSQL (Supabase) — ver [Decisiones técnicas](/decisions). Si se quiere usar Docker para desarrollo local hoy, habría que:
+
+- Reemplazar el servicio `mongo` por uno de `postgres` (el propio archivo trae, comentado, un bloque `postgres:` listo para descomentar).
+- Ajustar `DATABASE_URL` a una cadena de conexión Postgres.
+
+No se encontró evidencia de que este flujo Docker esté en uso activo por el equipo.
+
+## Generación de tipos e import maps
+
+Después de modificar una colección o agregar un componente custom del admin:
+
+```bash
+pnpm generate:types      # regenera src/payload-types.ts
+pnpm generate:importmap  # regenera el import map de componentes custom del admin
+```
+
+## Lint y verificación de tipos
+
+```bash
+pnpm lint          # ESLint (eslint.config.mjs, basado en eslint-config-next)
+tsc --noEmit       # Chequeo de tipos (recomendado en .cursor/rules tras cambios de schema)
+```
+
+## Testing
+
+```bash
+pnpm test:int   # Vitest — tests de integración contra la Local API de Payload (tests/int/)
+pnpm test:e2e   # Playwright — tests e2e de admin y frontend (tests/e2e/)
+pnpm test       # ambos, en secuencia
+```
+
+Notas:
+
+- `tests/int` corre con entorno `jsdom` y carga variables de `test.env`/`.env` vía `dotenv/config` (`vitest.setup.ts`). `test.env` solo fija flags de `NODE_OPTIONS`, no credenciales — los tests de integración usan las mismas variables de `.env` que el desarrollo local (no hay una base de datos de test aislada documentada). **TODO**: confirmar si existe o debería existir una `DATABASE_URL` separada para tests, para no correr tests de integración contra la base de datos real de Supabase.
+- `tests/e2e` levanta automáticamente `pnpm dev` como `webServer` (`playwright.config.ts`) contra `http://localhost:3000`, reutilizando un servidor ya corriendo si existe (`reuseExistingServer: true`).
+- Hay helpers en `tests/helpers/` (`login.ts`, `seedUser.ts`) para autenticar y crear usuarios de prueba.
